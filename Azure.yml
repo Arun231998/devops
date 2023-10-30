@@ -1,1 +1,14 @@
-greeting: Hello, World!
+trigger:
+- master 
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- script: echo Hello world!
+  displayName: 'Run a one-line script'
+
+- script: |
+   echo This script runs on the Ubuntu agent VM image
+   sleep 30 
+  displayName: 'Run a multi-line script'

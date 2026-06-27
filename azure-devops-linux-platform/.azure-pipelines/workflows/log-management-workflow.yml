@@ -1,0 +1,172 @@
+# ============================================================
+# Workflow: Automated Log Management
+# Schedule: Daily at 1:00 AM UTC
+# Purpose : Rotate logs, archive to Azure Blob, clean old logs
+# ============================================================
+
+schedules:
+- cron: "0 1 * * *"
+  displayName: 'Daily Log Management — 1AM UTC'
+  branches:
+    include:
+      - main
+  always: true
+
+trigger: none
+
+variables:
+  - group: infra-secrets
+  - name: RETENTION_DAYS
+    value: '30'
+  - name: AZURE_CONTAINER
+    value: 'logs-archive'
+  - name: LOG_DIRS
+    value: '/var/log /opt/linux-platform/logs'
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1: Log Rotation & Compression
+# ──────────────────────────────────────────────
+- stage: LogRotation
+  displayName: '🔄 Log Rotation'
+  jobs:
+  - job: RotateLogs
+    displayName: 'Rotate Logs on All Environments'
+    pool:
+      name: 'linux-agents-prod'
+    steps:
+    - script: |
+        echo "============================================"
+        echo " LOG MANAGEMENT — $(hostname)"
+        echo " Date      : $(date -u)"
+        echo " Retention : $(RETENTION_DAYS) days"
+        echo "============================================"
+
+        # Force log rotation
+        if command -v logrotate &>/dev/null; then
+          sudo logrotate -f /etc/logrotate.conf
+          echo "✅ logrotate completed"
+        else
+          echo "⚠️  logrotate not found — manual rotation"
+        fi
+
+        # Compress uncompressed logs older than 1 day
+        find /var/log -name "*.log" -mtime +1 -not -name "*.gz" | while read logfile; do
+          gzip -f "${logfile}" && echo "  Compressed: ${logfile}"
+        done
+
+        # Flush journal logs older than 7 days
+        sudo journalctl --vacuum-time=7d 2>/dev/null && \
+          echo "✅ Journal logs vacuumed (>7 days)"
+
+        # Clean old temp files
+        find /tmp -mtime +3 -delete 2>/dev/null && \
+          echo "✅ /tmp cleaned (>3 days)"
+
+        echo "✅ Log rotation complete."
+      displayName: 'Rotate & Compress Logs'
+
+    - script: |
+        echo "── Disk usage before vs after ──"
+        echo "Current /var/log usage:"
+        du -sh /var/log
+        echo "Current /tmp usage:"
+        du -sh /tmp
+      displayName: 'Report Disk Savings'
+
+# ──────────────────────────────────────────────
+# Stage 2: Archive to Azure Blob Storage
+# ──────────────────────────────────────────────
+- stage: ArchiveLogs
+  displayName: '☁️  Archive Logs to Azure'
+  dependsOn: LogRotation
+  condition: succeeded()
+  jobs:
+  - job: UploadToAzure
+    displayName: 'Upload Compressed Logs to Azure Blob'
+    pool:
+      name: 'linux-agents-prod'
+    steps:
+    - script: |
+        ARCHIVE_NAME="logs-$(hostname -s)-$(date +%Y%m%d).tar.gz"
+        STAGING_DIR="/tmp/log-archive-$(date +%Y%m%d)"
+        mkdir -p "${STAGING_DIR}"
+
+        # Collect logs modified in last 24h
+        find /var/log -name "*.gz" -mtime -1 -exec cp {} "${STAGING_DIR}/" \; 2>/dev/null || true
+        find /var/log -name "*.log" -mtime -1 -exec cp {} "${STAGING_DIR}/" \; 2>/dev/null || true
+
+        # Create archive
+        tar -czf "/tmp/${ARCHIVE_NAME}" "${STAGING_DIR}/"
+        ARCHIVE_SIZE=$(du -sh "/tmp/${ARCHIVE_NAME}" | awk '{print $1}')
+        echo "Archive: /tmp/${ARCHIVE_NAME} (${ARCHIVE_SIZE})"
+
+        # Upload to Azure Blob Storage
+        if command -v az &>/dev/null && [ -n "$(LOG_STORAGE_ACCOUNT)" ]; then
+          az storage blob upload \
+            --account-name "$(LOG_STORAGE_ACCOUNT)" \
+            --container-name "$(AZURE_CONTAINER)" \
+            --name "$(date +%Y/%m/%d)/${ARCHIVE_NAME}" \
+            --file "/tmp/${ARCHIVE_NAME}" \
+            --auth-mode login \
+            --overwrite true
+          echo "✅ Logs uploaded to Azure Blob: $(AZURE_CONTAINER)/$(date +%Y/%m/%d)/${ARCHIVE_NAME}"
+        else
+          echo "⚠️  Azure CLI not available or LOG_STORAGE_ACCOUNT not set. Skipping upload."
+        fi
+
+        # Cleanup staging
+        rm -rf "${STAGING_DIR}" "/tmp/${ARCHIVE_NAME}"
+        echo "✅ Staging area cleaned up."
+      displayName: 'Package & Upload Logs'
+
+# ──────────────────────────────────────────────
+# Stage 3: Enforce Retention Policy
+# ──────────────────────────────────────────────
+- stage: RetentionPolicy
+  displayName: '🗑️  Enforce Retention Policy'
+  dependsOn: ArchiveLogs
+  condition: always()
+  jobs:
+  - job: CleanOldLogs
+    displayName: 'Delete Logs Older Than Retention Period'
+    pool:
+      name: 'linux-agents-prod'
+    steps:
+    - script: |
+        echo "Enforcing $(RETENTION_DAYS)-day retention on local logs..."
+
+        # Delete old compressed logs
+        DELETED=0
+        while IFS= read -r file; do
+          rm -f "${file}"
+          ((DELETED++))
+          echo "  Deleted: ${file}"
+        done < <(find /var/log -name "*.gz" -mtime +$(RETENTION_DAYS) 2>/dev/null)
+
+        echo "✅ Deleted ${DELETED} old log files."
+
+        # Delete old Azure Blob logs (beyond retention)
+        if command -v az &>/dev/null && [ -n "$(LOG_STORAGE_ACCOUNT)" ]; then
+          CUTOFF_DATE=$(date -d "-$(RETENTION_DAYS) days" +%Y/%m/%d 2>/dev/null || \
+                        date -v-"$(RETENTION_DAYS)"d +%Y/%m/%d 2>/dev/null || echo "")
+          if [ -n "${CUTOFF_DATE}" ]; then
+            echo "Removing Azure Blob logs older than: ${CUTOFF_DATE}"
+            az storage blob delete-batch \
+              --account-name "$(LOG_STORAGE_ACCOUNT)" \
+              --source "$(AZURE_CONTAINER)" \
+              --if-unmodified-since "${CUTOFF_DATE}T00:00:00Z" \
+              --auth-mode login 2>/dev/null || true
+            echo "✅ Azure Blob retention enforced."
+          fi
+        fi
+      displayName: 'Apply Retention Policy'
+
+    - script: |
+        echo "── Final disk usage report ──"
+        df -h /var/log 2>/dev/null || df -h /var
+        echo ""
+        echo "Top 10 largest log files:"
+        find /var/log -type f | xargs ls -lh 2>/dev/null | sort -k5 -rh | head -10
+      displayName: 'Final Disk Report'

@@ -1,0 +1,211 @@
+# ============================================================
+# Workflow: Weekly Automated Patch Management
+# Schedule: Every Sunday at 2:00 AM UTC
+# Scope   : Security patches auto-applied; full patches need approval
+# ============================================================
+
+schedules:
+- cron: "0 2 * * 0"
+  displayName: 'Weekly Sunday Patching — 2AM UTC'
+  branches:
+    include:
+      - main
+  always: true
+
+trigger: none
+pr: none
+
+variables:
+  - group: infra-secrets
+  - name: PATCH_SCRIPT
+    value: 'azure-devops-linux-platform/scripts/patch-management.sh'
+  - name: HEALTH_SCRIPT
+    value: 'azure-devops-linux-platform/scripts/system-health-check.sh'
+  - name: MAINTENANCE_WINDOW
+    value: '120'    # minutes
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1: Pre-Patch Validation
+# ──────────────────────────────────────────────
+- stage: PrePatchValidation
+  displayName: '🔍 Pre-Patch Validation'
+  jobs:
+  - job: Validate
+    displayName: 'Validate Systems Before Patching'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "============================================"
+        echo " PRE-PATCH VALIDATION"
+        echo " Date    : $(date -u)"
+        echo " Window  : $(MAINTENANCE_WINDOW) minutes"
+        echo "============================================"
+
+        # Validate patch script exists
+        if [ ! -f "$(PATCH_SCRIPT)" ]; then
+          echo "##vso[task.logissue type=error]Patch script not found!"
+          exit 1
+        fi
+
+        echo "✅ Pre-patch validation complete."
+      displayName: 'Pre-Patch Checks'
+
+# ──────────────────────────────────────────────
+# Stage 2: Security-Only Patches — DEV (Auto)
+# ──────────────────────────────────────────────
+- stage: PatchDev
+  displayName: '🟦 Patch DEV — Security Only'
+  dependsOn: PrePatchValidation
+  condition: succeeded()
+  jobs:
+  - deployment: ApplyPatchesDev
+    displayName: 'Apply Security Patches to DEV'
+    environment: 'linux-platform-dev'
+    pool:
+      name: 'linux-agents-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "📋 Checking available security updates on DEV..."
+              chmod +x $(PATCH_SCRIPT)
+              sudo $(PATCH_SCRIPT) --dry-run --security-only
+            displayName: 'Dry Run — DEV Security Patches'
+
+          - script: |
+              echo "🔧 Applying security patches to DEV..."
+              sudo $(PATCH_SCRIPT) --security-only
+              echo "✅ DEV patching complete."
+            displayName: 'Apply Security Patches — DEV'
+
+          - script: |
+              echo "🔍 Post-patch health check on DEV..."
+              chmod +x $(HEALTH_SCRIPT)
+              $(HEALTH_SCRIPT)
+            displayName: 'Post-Patch Health Check — DEV'
+            condition: always()
+
+# ──────────────────────────────────────────────
+# Stage 3: Security-Only Patches — STAGING (Auto)
+# ──────────────────────────────────────────────
+- stage: PatchStaging
+  displayName: '🟨 Patch STAGING — Security Only'
+  dependsOn: PatchDev
+  condition: succeeded()
+  jobs:
+  - deployment: ApplyPatchesStaging
+    displayName: 'Apply Security Patches to STAGING'
+    environment: 'linux-platform-staging'
+    pool:
+      name: 'linux-agents-staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              chmod +x $(PATCH_SCRIPT)
+              sudo $(PATCH_SCRIPT) --dry-run --security-only
+            displayName: 'Dry Run — STAGING Security Patches'
+
+          - script: |
+              sudo $(PATCH_SCRIPT) --security-only
+              echo "✅ STAGING patching complete."
+            displayName: 'Apply Security Patches — STAGING'
+
+          - script: |
+              chmod +x $(HEALTH_SCRIPT)
+              $(HEALTH_SCRIPT)
+            displayName: 'Post-Patch Health Check — STAGING'
+            condition: always()
+
+# ──────────────────────────────────────────────
+# Stage 4: PRODUCTION — Manual Approval Required
+# ──────────────────────────────────────────────
+- stage: PatchProd
+  displayName: '🟥 Patch PRODUCTION — Approval Required'
+  dependsOn: PatchStaging
+  condition: succeeded()
+  jobs:
+  - deployment: ApplyPatchesProd
+    displayName: 'Apply Security Patches to PRODUCTION'
+    environment: 'linux-platform-prod'     # ← Approval gate in Azure DevOps portal
+    pool:
+      name: 'linux-agents-prod'
+    strategy:
+      rolling:
+        maxParallel: 1                     # Patch one node at a time
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              echo "⚠️  PRODUCTION Patching — $(hostname)"
+              echo "Approved by: $(Build.RequestedFor)"
+              echo "Build ID   : $(Build.BuildId)"
+              echo "Timestamp  : $(date -u)"
+            displayName: 'Log Approval Details'
+
+          - script: |
+              # Snapshot pre-patch state
+              dpkg -l 2>/dev/null > /tmp/pre-patch-state-$(date +%Y%m%d).txt || \
+                rpm -qa     > /tmp/pre-patch-state-$(date +%Y%m%d).txt
+              echo "✅ Pre-patch snapshot saved."
+            displayName: 'Snapshot Pre-Patch State'
+
+          - script: |
+              chmod +x $(PATCH_SCRIPT)
+              sudo $(PATCH_SCRIPT) --security-only
+              echo "✅ PRODUCTION patching complete."
+            displayName: 'Apply Security Patches — PRODUCTION'
+
+          - script: |
+              chmod +x $(HEALTH_SCRIPT)
+              $(HEALTH_SCRIPT)
+            displayName: 'Post-Patch Health Check — PRODUCTION'
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Archive Patch Report'
+            inputs:
+              targetPath: '/tmp/patch-report-*.txt'
+              artifact: 'patch-report-prod-$(Build.BuildId)'
+            condition: always()
+            continueOnError: true
+
+# ──────────────────────────────────────────────
+# Stage 5: Patch Compliance Report
+# ──────────────────────────────────────────────
+- stage: ComplianceReport
+  displayName: '📊 Patch Compliance Report'
+  dependsOn:
+    - PatchDev
+    - PatchStaging
+    - PatchProd
+  condition: always()
+  jobs:
+  - job: Report
+    displayName: 'Generate Compliance Report'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "=========================================="
+        echo " WEEKLY PATCH COMPLIANCE REPORT"
+        echo " Date    : $(date -u)"
+        echo " Build   : $(Build.BuildId)"
+        echo "=========================================="
+        echo "DEV     : ${{ stageDependencies.PatchDev.ApplyPatchesDev.result }}"
+        echo "STAGING : ${{ stageDependencies.PatchStaging.ApplyPatchesStaging.result }}"
+        echo "PROD    : ${{ stageDependencies.PatchProd.ApplyPatchesProd.result }}"
+        echo "=========================================="
+      displayName: 'Print Patch Summary'

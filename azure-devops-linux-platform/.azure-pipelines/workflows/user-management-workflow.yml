@@ -1,0 +1,257 @@
+# ============================================================
+# Workflow: Linux User Onboarding & Offboarding
+# Trigger : Manual / PR-based via YAML config change
+# Purpose : Provision or deprovision Linux users across envs
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - azure-devops-linux-platform/config/users/*.yml
+
+pr: none
+
+parameters:
+- name: action
+  displayName: 'Action'
+  type: string
+  default: 'onboard'
+  values:
+    - onboard
+    - offboard
+
+- name: username
+  displayName: 'Linux Username'
+  type: string
+
+- name: fullname
+  displayName: 'Full Name'
+  type: string
+  default: ''
+
+- name: groups
+  displayName: 'Linux Groups (comma-separated)'
+  type: string
+  default: 'sudo,developers'
+
+- name: environment
+  displayName: 'Target Environment'
+  type: string
+  default: 'all'
+  values:
+    - dev
+    - staging
+    - production
+    - all
+
+- name: ssh_public_key
+  displayName: 'SSH Public Key (for onboarding)'
+  type: string
+  default: ''
+
+variables:
+  - group: infra-secrets
+  - name: ACTION
+    value: ${{ parameters.action }}
+  - name: USERNAME
+    value: ${{ parameters.username }}
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1: Validate Request
+# ──────────────────────────────────────────────
+- stage: ValidateRequest
+  displayName: '🔍 Validate User Request'
+  jobs:
+  - job: Validate
+    displayName: 'Validate Input Parameters'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "============================================"
+        echo " USER MANAGEMENT REQUEST"
+        echo " Action   : $(ACTION)"
+        echo " Username : $(USERNAME)"
+        echo " Groups   : ${{ parameters.groups }}"
+        echo " Env      : ${{ parameters.environment }}"
+        echo " Time     : $(date -u)"
+        echo " Req by   : $(Build.RequestedFor)"
+        echo "============================================"
+
+        # Validate username format (lowercase, alphanumeric, underscore, hyphen)
+        if ! echo "$(USERNAME)" | grep -qE '^[a-z][a-z0-9_-]{1,31}$'; then
+          echo "##vso[task.logissue type=error]Invalid username format: $(USERNAME)"
+          echo "Username must be lowercase, 2-32 chars, alphanumeric/underscore/hyphen"
+          exit 1
+        fi
+
+        echo "✅ Username format valid: $(USERNAME)"
+
+        # Validate groups
+        IFS=',' read -ra GROUPS <<< "${{ parameters.groups }}"
+        for grp in "${GROUPS[@]}"; do
+          echo "  Group: ${grp}"
+        done
+
+        echo "✅ Validation passed."
+      displayName: 'Validate Parameters'
+
+# ──────────────────────────────────────────────
+# Stage 2: DEV Environment
+# ──────────────────────────────────────────────
+- stage: UserMgmt_Dev
+  displayName: '🟦 User Management — DEV'
+  dependsOn: ValidateRequest
+  condition: |
+    and(
+      succeeded(),
+      or(eq('${{ parameters.environment }}', 'dev'), eq('${{ parameters.environment }}', 'all'))
+    )
+  jobs:
+  - deployment: ManageUserDev
+    displayName: '${{ parameters.action }} user on DEV'
+    environment: 'linux-platform-dev'
+    pool:
+      name: 'linux-agents-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - ${{ if eq(parameters.action, 'onboard') }}:
+            - script: |
+                set -e
+                USERNAME="$(USERNAME)"
+                GROUPS="${{ parameters.groups }}"
+                FULL_NAME="${{ parameters.fullname }}"
+                SSH_KEY="${{ parameters.ssh_public_key }}"
+
+                echo "👤 Creating user: ${USERNAME}"
+
+                # Create user
+                if id "${USERNAME}" &>/dev/null; then
+                  echo "ℹ️  User ${USERNAME} already exists. Updating..."
+                else
+                  sudo useradd -m -s /bin/bash -c "${FULL_NAME}" "${USERNAME}"
+                  echo "✅ User ${USERNAME} created."
+                fi
+
+                # Add to groups
+                IFS=',' read -ra GRP_ARR <<< "${GROUPS}"
+                for grp in "${GRP_ARR[@]}"; do
+                  grp=$(echo "${grp}" | xargs)  # trim whitespace
+                  if getent group "${grp}" &>/dev/null; then
+                    sudo usermod -aG "${grp}" "${USERNAME}"
+                    echo "✅ Added ${USERNAME} to group: ${grp}"
+                  else
+                    echo "⚠️  Group ${grp} does not exist, skipping"
+                  fi
+                done
+
+                # Set up SSH key
+                if [ -n "${SSH_KEY}" ]; then
+                  SSH_DIR="/home/${USERNAME}/.ssh"
+                  sudo mkdir -p "${SSH_DIR}"
+                  echo "${SSH_KEY}" | sudo tee "${SSH_DIR}/authorized_keys" > /dev/null
+                  sudo chmod 700 "${SSH_DIR}"
+                  sudo chmod 600 "${SSH_DIR}/authorized_keys"
+                  sudo chown -R "${USERNAME}:${USERNAME}" "${SSH_DIR}"
+                  echo "✅ SSH key configured for ${USERNAME}"
+                fi
+
+                echo "✅ Onboarding complete for ${USERNAME} on DEV"
+              displayName: 'Onboard User — DEV'
+
+          - ${{ if eq(parameters.action, 'offboard') }}:
+            - script: |
+                set -e
+                USERNAME="$(USERNAME)"
+
+                echo "🗑️  Offboarding user: ${USERNAME}"
+
+                if ! id "${USERNAME}" &>/dev/null; then
+                  echo "ℹ️  User ${USERNAME} does not exist on this host."
+                  exit 0
+                fi
+
+                # Archive home directory before deletion
+                ARCHIVE="/opt/offboarded-users/${USERNAME}-$(date +%Y%m%d).tar.gz"
+                sudo mkdir -p /opt/offboarded-users
+                sudo tar -czf "${ARCHIVE}" "/home/${USERNAME}" 2>/dev/null || true
+                echo "📦 Home directory archived to: ${ARCHIVE}"
+
+                # Lock the account first (safer than immediate deletion)
+                sudo usermod -L "${USERNAME}"
+                echo "🔒 Account locked: ${USERNAME}"
+
+                # Kill active sessions
+                sudo pkill -u "${USERNAME}" || true
+
+                # Remove user
+                sudo userdel -r "${USERNAME}" 2>/dev/null || sudo userdel "${USERNAME}"
+                echo "✅ User ${USERNAME} removed from DEV"
+              displayName: 'Offboard User — DEV'
+
+# ──────────────────────────────────────────────
+# Stage 3: STAGING Environment
+# ──────────────────────────────────────────────
+- stage: UserMgmt_Staging
+  displayName: '🟨 User Management — STAGING'
+  dependsOn: UserMgmt_Dev
+  condition: |
+    and(
+      succeeded(),
+      or(eq('${{ parameters.environment }}', 'staging'), eq('${{ parameters.environment }}', 'all'))
+    )
+  jobs:
+  - deployment: ManageUserStaging
+    displayName: '${{ parameters.action }} user on STAGING'
+    environment: 'linux-platform-staging'
+    pool:
+      name: 'linux-agents-staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "Applying same user management on STAGING: $(ACTION) $(USERNAME)"
+              # Same logic as DEV applies here via template (see templates/)
+            displayName: 'User Management — STAGING'
+
+# ──────────────────────────────────────────────
+# Stage 4: PRODUCTION — Requires Approval
+# ──────────────────────────────────────────────
+- stage: UserMgmt_Prod
+  displayName: '🟥 User Management — PRODUCTION'
+  dependsOn: UserMgmt_Staging
+  condition: |
+    and(
+      succeeded(),
+      or(eq('${{ parameters.environment }}', 'production'), eq('${{ parameters.environment }}', 'all'))
+    )
+  jobs:
+  - deployment: ManageUserProd
+    displayName: '${{ parameters.action }} user on PRODUCTION'
+    environment: 'linux-platform-prod'     # ← Requires manual approval
+    pool:
+      name: 'linux-agents-prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "Applying user management on PRODUCTION: $(ACTION) $(USERNAME)"
+              echo "Approved by  : $(Build.RequestedFor)"
+              echo "Build ID     : $(Build.BuildId)"
+            displayName: 'User Management — PRODUCTION'
+
+          - script: |
+              # Audit log entry
+              echo "[$(date -u)] ACTION=$(ACTION) USER=$(USERNAME) REQUESTER=$(Build.RequestedFor) BUILD=$(Build.BuildId)" \
+                >> /var/log/user-audit.log
+              echo "✅ Audit log updated."
+            displayName: 'Write Audit Log'

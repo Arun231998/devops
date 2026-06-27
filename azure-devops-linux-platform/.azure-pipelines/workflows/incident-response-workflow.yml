@@ -1,0 +1,277 @@
+# ============================================================
+# Workflow: Automated Incident Response (Auto-Remediation)
+# Trigger : On-demand (webhook / alert-triggered)
+# Purpose : Auto-remediate common production incidents:
+#           high CPU, disk full, service crash, memory pressure
+# ============================================================
+
+trigger: none
+pr: none
+
+parameters:
+- name: incident_type
+  displayName: 'Incident Type'
+  type: string
+  default: 'health-check'
+  values:
+    - health-check
+    - high-cpu
+    - high-memory
+    - disk-full
+    - service-down
+    - network-issue
+
+- name: incident_id
+  displayName: 'Incident / Ticket ID'
+  type: string
+  default: 'INC-AUTO'
+
+- name: target_host
+  displayName: 'Target Host (leave blank for all prod)'
+  type: string
+  default: ''
+
+- name: service_name
+  displayName: 'Service Name (for service-down incidents)'
+  type: string
+  default: ''
+
+variables:
+  - group: infra-secrets
+  - name: INCIDENT_ID
+    value: ${{ parameters.incident_id }}
+  - name: TRIAGE_SCRIPT
+    value: 'azure-devops-linux-platform/incident-management/triage.sh'
+  - name: HEALTH_SCRIPT
+    value: 'azure-devops-linux-platform/scripts/system-health-check.sh'
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1: Automated Triage
+# ──────────────────────────────────────────────
+- stage: AutoTriage
+  displayName: '🔍 Automated Triage — $(INCIDENT_ID)'
+  jobs:
+  - job: Triage
+    displayName: 'Run Automated Triage'
+    pool:
+      name: 'linux-agents-prod'
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "============================================"
+        echo " INCIDENT RESPONSE TRIGGERED"
+        echo " ID      : $(INCIDENT_ID)"
+        echo " Type    : ${{ parameters.incident_type }}"
+        echo " Host    : $(hostname -f)"
+        echo " Time    : $(date -u)"
+        echo " Trigger : $(Build.RequestedFor)"
+        echo "============================================"
+
+        chmod +x $(TRIAGE_SCRIPT)
+        $(TRIAGE_SCRIPT) "$(INCIDENT_ID)" --severity P1
+      displayName: 'Run Triage Script'
+      continueOnError: true
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '/tmp/incident-reports/'
+        artifact: 'triage-$(INCIDENT_ID)-$(Build.BuildId)'
+      condition: always()
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# Stage 2: Auto-Remediation (by incident type)
+# ──────────────────────────────────────────────
+- stage: AutoRemediate
+  displayName: '🔧 Auto-Remediation — ${{ parameters.incident_type }}'
+  dependsOn: AutoTriage
+  condition: succeeded()
+  jobs:
+
+  # ── HIGH CPU ───────────────────────────────
+  - ${{ if eq(parameters.incident_type, 'high-cpu') }}:
+    - job: RemediateHighCPU
+      displayName: 'Remediate: High CPU'
+      pool:
+        name: 'linux-agents-prod'
+      steps:
+      - script: |
+          echo "🔧 Remediating HIGH CPU on $(hostname)..."
+
+          # Identify top CPU consumer
+          TOP_PID=$(ps aux --sort=-%cpu | awk 'NR==2{print $2}')
+          TOP_CMD=$(ps aux --sort=-%cpu | awk 'NR==2{print $11}')
+          TOP_CPU=$(ps aux --sort=-%cpu | awk 'NR==2{print $3}')
+          echo "Top CPU process: PID=${TOP_PID} CMD=${TOP_CMD} CPU=${TOP_CPU}%"
+
+          # Auto-renice if CPU > 80%
+          if (( $(echo "${TOP_CPU} > 80" | bc -l) )); then
+            echo "⚠️  Renicing PID ${TOP_PID} to priority 10..."
+            sudo renice +10 -p "${TOP_PID}" && echo "✅ Reniced PID ${TOP_PID}"
+          fi
+
+          # Clear page cache to free memory pressure
+          echo 1 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+          echo "✅ Page cache cleared."
+
+          # Log remediation action
+          echo "[$(date -u)] INCIDENT=$(INCIDENT_ID) ACTION=renice PID=${TOP_PID} CMD=${TOP_CMD}" \
+            >> /var/log/auto-remediation.log
+        displayName: 'Renice Top CPU Process'
+
+  # ── HIGH MEMORY ────────────────────────────
+  - ${{ if eq(parameters.incident_type, 'high-memory') }}:
+    - job: RemediateHighMemory
+      displayName: 'Remediate: High Memory'
+      pool:
+        name: 'linux-agents-prod'
+      steps:
+      - script: |
+          echo "🔧 Remediating HIGH MEMORY on $(hostname)..."
+
+          # Drop caches
+          sync
+          echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+          echo "✅ Dropped page/slab/inode caches."
+
+          # Show top memory consumers
+          echo "Top memory processes:"
+          ps aux --sort=-%mem | head -6
+
+          # If swap is available, identify candidates
+          MEM_PCT=$(free | awk '/^Mem:/{printf "%.0f", $3/$2*100}')
+          echo "Memory usage after remediation: ${MEM_PCT}%"
+
+          echo "[$(date -u)] INCIDENT=$(INCIDENT_ID) ACTION=drop-caches MEM=${MEM_PCT}%" \
+            >> /var/log/auto-remediation.log
+        displayName: 'Drop Caches & Report'
+
+  # ── DISK FULL ──────────────────────────────
+  - ${{ if eq(parameters.incident_type, 'disk-full') }}:
+    - job: RemediateDiskFull
+      displayName: 'Remediate: Disk Full'
+      pool:
+        name: 'linux-agents-prod'
+      steps:
+      - script: |
+          echo "🔧 Remediating DISK FULL on $(hostname)..."
+
+          echo "── Before cleanup ──"
+          df -h
+
+          # Clear journal logs
+          sudo journalctl --vacuum-size=500M 2>/dev/null && \
+            echo "✅ Journal logs vacuumed to 500MB"
+
+          # Clear old compressed logs (>14 days)
+          DELETED=0
+          while IFS= read -r f; do
+            rm -f "${f}"; ((DELETED++))
+          done < <(find /var/log -name "*.gz" -mtime +14 2>/dev/null)
+          echo "✅ Deleted ${DELETED} old log archives"
+
+          # Clear /tmp
+          find /tmp -mtime +1 -delete 2>/dev/null && echo "✅ /tmp cleaned"
+
+          # Clear apt/yum cache
+          if command -v apt-get &>/dev/null; then
+            sudo apt-get clean -y && echo "✅ apt cache cleared"
+          elif command -v yum &>/dev/null; then
+            sudo yum clean all && echo "✅ yum cache cleared"
+          fi
+
+          echo "── After cleanup ──"
+          df -h
+
+          echo "[$(date -u)] INCIDENT=$(INCIDENT_ID) ACTION=disk-cleanup" \
+            >> /var/log/auto-remediation.log
+        displayName: 'Clean Disk Space'
+
+  # ── SERVICE DOWN ───────────────────────────
+  - ${{ if eq(parameters.incident_type, 'service-down') }}:
+    - job: RemediateServiceDown
+      displayName: 'Remediate: Service Down'
+      pool:
+        name: 'linux-agents-prod'
+      steps:
+      - script: |
+          SERVICE="${{ parameters.service_name }}"
+          echo "🔧 Attempting to restart service: ${SERVICE}"
+
+          if [ -z "${SERVICE}" ]; then
+            echo "##vso[task.logissue type=error]No service_name provided!"
+            exit 1
+          fi
+
+          # Check current status
+          echo "Current status:"
+          systemctl status "${SERVICE}" --no-pager || true
+
+          # Attempt restart
+          sudo systemctl restart "${SERVICE}"
+          sleep 5
+
+          # Verify
+          if systemctl is-active --quiet "${SERVICE}"; then
+            echo "✅ Service ${SERVICE} restarted successfully."
+          else
+            echo "##vso[task.logissue type=error]Service ${SERVICE} failed to restart!"
+            journalctl -u "${SERVICE}" -n 30 --no-pager
+            exit 1
+          fi
+
+          echo "[$(date -u)] INCIDENT=$(INCIDENT_ID) ACTION=restart-service SERVICE=${SERVICE}" \
+            >> /var/log/auto-remediation.log
+        displayName: 'Restart Failed Service'
+
+  # ── HEALTH CHECK ───────────────────────────
+  - ${{ if eq(parameters.incident_type, 'health-check') }}:
+    - job: RunHealthCheck
+      displayName: 'Run Full Health Check'
+      pool:
+        name: 'linux-agents-prod'
+      steps:
+      - checkout: self
+      - script: |
+          chmod +x $(HEALTH_SCRIPT)
+          $(HEALTH_SCRIPT)
+        displayName: 'Full System Health Check'
+
+# ──────────────────────────────────────────────
+# Stage 3: Post-Remediation Verification
+# ──────────────────────────────────────────────
+- stage: Verify
+  displayName: '✅ Post-Remediation Verification'
+  dependsOn: AutoRemediate
+  condition: always()
+  jobs:
+  - job: PostCheck
+    displayName: 'Verify System After Remediation'
+    pool:
+      name: 'linux-agents-prod'
+    steps:
+    - checkout: self
+
+    - script: |
+        chmod +x $(HEALTH_SCRIPT)
+        $(HEALTH_SCRIPT)
+        echo "✅ Post-remediation health check complete."
+      displayName: 'Post-Remediation Health Check'
+      continueOnError: true
+
+    - script: |
+        echo "======================================================"
+        echo " INCIDENT SUMMARY — $(INCIDENT_ID)"
+        echo " Type       : ${{ parameters.incident_type }}"
+        echo " Host       : $(hostname -f)"
+        echo " Resolved by: Auto-remediation pipeline"
+        echo " Build      : $(Build.BuildId)"
+        echo " Time       : $(date -u)"
+        echo "======================================================"
+        echo "📋 Triage report saved in pipeline artifacts."
+        echo "📋 Check /var/log/auto-remediation.log for history."
+      displayName: 'Incident Summary'
+      condition: always()

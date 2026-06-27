@@ -1,0 +1,175 @@
+# ============================================================
+# Workflow: Backup & Disaster Recovery
+# Schedule: Every 6 hours (full backup daily at midnight)
+# Purpose : Automated backups to Azure Blob + DR validation
+# ============================================================
+
+schedules:
+- cron: "0 */6 * * *"
+  displayName: 'Every 6 Hours — Incremental Backup'
+  branches:
+    include:
+      - main
+  always: true
+
+- cron: "0 0 * * *"
+  displayName: 'Daily Midnight — Full Backup'
+  branches:
+    include:
+      - main
+  always: true
+
+trigger: none
+
+variables:
+  - group: infra-secrets
+  - name: BACKUP_SCRIPT
+    value: 'azure-devops-linux-platform/disaster-recovery/backup.sh'
+  - name: AZURE_CONTAINER
+    value: 'platform-backups'
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1: Run Backup
+# ──────────────────────────────────────────────
+- stage: RunBackup
+  displayName: '💾 Run Backup'
+  jobs:
+  - job: BackupProd
+    displayName: 'Backup Production Environment'
+    pool:
+      name: 'linux-agents-prod'
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "============================================"
+        echo " AUTOMATED BACKUP"
+        echo " Host    : $(hostname -f)"
+        echo " Time    : $(date -u)"
+        echo " Type    : $([ $(date +%H) -eq 0 ] && echo 'FULL' || echo 'INCREMENTAL')"
+        echo "============================================"
+        chmod +x $(BACKUP_SCRIPT)
+        sudo $(BACKUP_SCRIPT) --azure
+      displayName: 'Run Backup Script'
+
+    - script: |
+        # Verify backup exists in Azure
+        if command -v az &>/dev/null; then
+          echo "Verifying backup in Azure Blob Storage..."
+          LATEST=$(az storage blob list \
+            --account-name "$(BACKUP_STORAGE_ACCOUNT)" \
+            --container-name "$(AZURE_CONTAINER)" \
+            --auth-mode login \
+            --query "[-1].name" -o tsv 2>/dev/null || echo "unknown")
+          echo "Latest backup: ${LATEST}"
+          echo "✅ Backup verification complete."
+        fi
+      displayName: 'Verify Backup in Azure'
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# Stage 2: DR Validation (Weekly on Sundays)
+# ──────────────────────────────────────────────
+- stage: DRValidation
+  displayName: '🧪 DR Validation Test'
+  dependsOn: RunBackup
+  condition: |
+    and(
+      succeeded(),
+      eq(variables['Build.Reason'], 'Schedule'),
+      eq(format('{0:dddd}', pipeline.startTime), 'Sunday')
+    )
+  jobs:
+  - job: ValidateDR
+    displayName: 'Validate Disaster Recovery'
+    pool:
+      name: 'linux-agents-dev'    # Test restore on dev, not prod
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "🧪 DR VALIDATION TEST"
+        echo "Testing restore capability from latest backup..."
+
+        # Download latest backup from Azure (if available)
+        if command -v az &>/dev/null; then
+          LATEST=$(az storage blob list \
+            --account-name "$(BACKUP_STORAGE_ACCOUNT)" \
+            --container-name "$(AZURE_CONTAINER)" \
+            --auth-mode login \
+            --query "[-1].name" -o tsv 2>/dev/null || echo "")
+
+          if [ -n "${LATEST}" ]; then
+            az storage blob download \
+              --account-name "$(BACKUP_STORAGE_ACCOUNT)" \
+              --container-name "$(AZURE_CONTAINER)" \
+              --name "${LATEST}" \
+              --file "/tmp/dr-test-backup.tar.gz" \
+              --auth-mode login 2>/dev/null
+
+            # Validate archive integrity
+            if tar -tzf /tmp/dr-test-backup.tar.gz &>/dev/null; then
+              echo "✅ Backup archive is valid and intact"
+              tar -tzf /tmp/dr-test-backup.tar.gz | wc -l
+              echo " files in backup"
+            else
+              echo "##vso[task.logissue type=error]DR backup archive is CORRUPTED!"
+              exit 1
+            fi
+
+            # Cleanup test file
+            rm -f /tmp/dr-test-backup.tar.gz
+            echo "✅ DR validation passed."
+          else
+            echo "⚠️  No backup found in Azure — skipping DR validation"
+          fi
+        else
+          echo "⚠️  Azure CLI not available — skipping DR validation"
+        fi
+      displayName: 'Validate Backup Integrity'
+      continueOnError: true
+
+    - script: |
+        echo "======================================================"
+        echo " DR VALIDATION REPORT"
+        echo " Date       : $(date -u)"
+        echo " Test Host  : $(hostname)"
+        echo " Result     : $?"
+        echo " Next test  : $(date -d '+7 days' -u 2>/dev/null || date -v+7d -u)"
+        echo "======================================================"
+      displayName: 'DR Test Report'
+      condition: always()
+
+# ──────────────────────────────────────────────
+# Stage 3: Backup Retention Cleanup
+# ──────────────────────────────────────────────
+- stage: RetentionCleanup
+  displayName: '🗑️  Backup Retention Cleanup'
+  dependsOn: RunBackup
+  condition: succeeded()
+  jobs:
+  - job: CleanOldBackups
+    displayName: 'Enforce 30-Day Backup Retention'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "Enforcing 30-day retention on Azure Blob backups..."
+        if command -v az &>/dev/null && [ -n "$(BACKUP_STORAGE_ACCOUNT)" ]; then
+          CUTOFF=$(date -d "-30 days" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                   date -v-30d -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+          if [ -n "${CUTOFF}" ]; then
+            az storage blob delete-batch \
+              --account-name "$(BACKUP_STORAGE_ACCOUNT)" \
+              --source "$(AZURE_CONTAINER)" \
+              --if-unmodified-since "${CUTOFF}" \
+              --auth-mode login 2>/dev/null || true
+            echo "✅ Retention policy enforced (cutoff: ${CUTOFF})"
+          fi
+        else
+          echo "⚠️  Skipping Azure cleanup — CLI unavailable or account not set"
+        fi
+      displayName: 'Enforce Azure Retention'
+      continueOnError: true

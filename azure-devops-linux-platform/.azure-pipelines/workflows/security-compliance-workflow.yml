@@ -1,0 +1,229 @@
+# ============================================================
+# Workflow: Security Compliance Scan
+# Schedule: Daily at midnight UTC + on-demand
+# Purpose : CIS benchmark checks, vulnerability scanning,
+#           failed login audits, open port review
+# ============================================================
+
+schedules:
+- cron: "0 0 * * *"
+  displayName: 'Daily Security Compliance Scan — Midnight UTC'
+  branches:
+    include:
+      - main
+  always: true
+
+trigger: none
+
+variables:
+  - group: infra-secrets
+  - name: REPORT_DIR
+    value: '/tmp/security-reports'
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1: Static Code & Secret Scanning
+# ──────────────────────────────────────────────
+- stage: StaticScan
+  displayName: '🔐 Static & Secret Scanning'
+  jobs:
+  - job: SecretScan
+    displayName: 'Secret Detection Scan'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - script: |
+        pip install detect-secrets --quiet
+        echo "🔍 Scanning for secrets and credentials..."
+        detect-secrets scan --all-files \
+          --exclude-files '.*\.md$' \
+          --exclude-files '.*\.txt$' \
+          > .secrets.baseline 2>/dev/null || true
+        SECRETS=$(cat .secrets.baseline | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        count = sum(len(v) for v in data.get('results', {}).values())
+        print(count)
+        " 2>/dev/null || echo "0")
+        echo "Secrets/credentials found: ${SECRETS}"
+        if [ "${SECRETS}" -gt 0 ]; then
+          echo "##vso[task.logissue type=warning]${SECRETS} potential secret(s) detected!"
+          detect-secrets audit .secrets.baseline || true
+        else
+          echo "✅ No secrets detected."
+        fi
+      displayName: 'Detect Secrets'
+
+  - job: TrivyScan
+    displayName: 'Trivy Vulnerability Scan'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sh -s -- -b /usr/local/bin v0.50.0
+        echo "🔍 Running Trivy filesystem scan..."
+        trivy fs \
+          --exit-code 0 \
+          --severity HIGH,CRITICAL \
+          --format table \
+          --output /tmp/trivy-report.txt \
+          . || true
+        cat /tmp/trivy-report.txt
+        CRITICAL=$(grep -c "CRITICAL" /tmp/trivy-report.txt || echo "0")
+        HIGH=$(grep -c "HIGH" /tmp/trivy-report.txt || echo "0")
+        echo "Critical: ${CRITICAL} | High: ${HIGH}"
+        if [ "${CRITICAL}" -gt 0 ]; then
+          echo "##vso[task.logissue type=error]${CRITICAL} CRITICAL vulnerabilities found!"
+        fi
+      displayName: 'Trivy FS Scan'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '/tmp/trivy-report.txt'
+        artifact: 'trivy-report-$(Build.BuildId)'
+      condition: always()
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# Stage 2: Linux Host Security Audit
+# ──────────────────────────────────────────────
+- stage: HostSecurityAudit
+  displayName: '🛡️  Linux Host Security Audit'
+  dependsOn: StaticScan
+  condition: always()
+  jobs:
+  - job: AuditProd
+    displayName: 'Security Audit — Production Hosts'
+    pool:
+      name: 'linux-agents-prod'
+    continueOnError: true
+    steps:
+    - script: |
+        mkdir -p $(REPORT_DIR)
+        REPORT="$(REPORT_DIR)/security-audit-$(hostname)-$(date +%Y%m%d).txt"
+
+        {
+          echo "======================================================"
+          echo " SECURITY COMPLIANCE AUDIT"
+          echo " Host      : $(hostname -f)"
+          echo " Timestamp : $(date -u)"
+          echo "======================================================"
+
+          echo ""
+          echo "── 1. Failed Login Attempts (last 24h) ──"
+          lastb 2>/dev/null | grep "$(date +%b)" | head -20 || echo "No failed logins / lastb unavailable"
+          FAIL_COUNT=$(lastb 2>/dev/null | grep -c "$(date +%b)" || echo "0")
+          echo "Total failed logins today: ${FAIL_COUNT}"
+          [ "${FAIL_COUNT}" -gt 50 ] && echo "⚠️  HIGH number of failed logins!"
+
+          echo ""
+          echo "── 2. Open Listening Ports ──"
+          ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null
+
+          echo ""
+          echo "── 3. SUID/SGID Files (outside /usr) ──"
+          find / -perm /4000 -o -perm /2000 2>/dev/null \
+            | grep -v "^/usr\|^/bin\|^/sbin\|^/proc" | head -20 || echo "None found"
+
+          echo ""
+          echo "── 4. World-Writable Files (outside /tmp, /proc) ──"
+          find / -perm -o+w -not -path "/tmp/*" -not -path "/proc/*" \
+            -not -path "/sys/*" 2>/dev/null | head -20 || echo "None found"
+
+          echo ""
+          echo "── 5. Unowned Files ──"
+          find / -nouser -o -nogroup 2>/dev/null \
+            | grep -v "^/proc\|^/sys" | head -10 || echo "None found"
+
+          echo ""
+          echo "── 6. Users with UID 0 (root-equivalent) ──"
+          awk -F: '($3==0){print $1}' /etc/passwd
+
+          echo ""
+          echo "── 7. Users with Empty Passwords ──"
+          awk -F: '($2==""){print $1}' /etc/shadow 2>/dev/null || echo "Cannot read /etc/shadow (non-root)"
+
+          echo ""
+          echo "── 8. Firewall Status ──"
+          systemctl is-active firewalld 2>/dev/null || \
+            systemctl is-active ufw 2>/dev/null || \
+            echo "⚠️  No firewall detected!"
+
+          echo ""
+          echo "── 9. SSH Configuration Audit ──"
+          if [ -f /etc/ssh/sshd_config ]; then
+            echo "PermitRootLogin   : $(grep -i PermitRootLogin /etc/ssh/sshd_config | head -1 || echo 'not set')"
+            echo "PasswordAuth      : $(grep -i PasswordAuthentication /etc/ssh/sshd_config | head -1 || echo 'not set')"
+            echo "MaxAuthTries      : $(grep -i MaxAuthTries /etc/ssh/sshd_config | head -1 || echo 'not set')"
+            echo "Protocol          : $(grep -i Protocol /etc/ssh/sshd_config | head -1 || echo 'default')"
+          fi
+
+          echo ""
+          echo "── 10. Outdated Packages (CVE Candidates) ──"
+          if command -v apt-get &>/dev/null; then
+            apt-get -s upgrade 2>/dev/null | grep "^Inst" | wc -l
+            echo " packages have available updates"
+          elif command -v yum &>/dev/null; then
+            yum check-update -q 2>/dev/null | grep -c "^[a-zA-Z]" || echo "0 packages pending"
+          fi
+
+          echo ""
+          echo "── 11. Crontab Audit (all users) ──"
+          for user in $(cut -f1 -d: /etc/passwd); do
+            cron=$(crontab -u "${user}" -l 2>/dev/null)
+            if [ -n "${cron}" ]; then
+              echo "User ${user}:"
+              echo "${cron}"
+            fi
+          done
+
+          echo ""
+          echo "======================================================"
+          echo " AUDIT COMPLETE"
+          echo "======================================================"
+        } | tee "${REPORT}"
+
+        echo "✅ Security audit report: ${REPORT}"
+      displayName: 'Run Security Audit'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Security Report'
+      inputs:
+        targetPath: '$(REPORT_DIR)'
+        artifact: 'security-audit-$(Build.BuildId)'
+      condition: always()
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# Stage 3: Compliance Gate
+# ──────────────────────────────────────────────
+- stage: ComplianceGate
+  displayName: '✅ Compliance Gate'
+  dependsOn:
+    - StaticScan
+    - HostSecurityAudit
+  condition: always()
+  jobs:
+  - job: EvaluateCompliance
+    displayName: 'Evaluate Compliance Status'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "========================================"
+        echo " COMPLIANCE GATE EVALUATION"
+        echo " Date   : $(date -u)"
+        echo " Build  : $(Build.BuildId)"
+        echo "========================================"
+        echo "Static Scan : ${{ stageDependencies.StaticScan.SecretScan.result }}"
+        echo "Host Audit  : ${{ stageDependencies.HostSecurityAudit.AuditProd.result }}"
+        echo ""
+        echo "📋 Full reports available in pipeline artifacts."
+        echo "========================================"
+      displayName: 'Compliance Summary'

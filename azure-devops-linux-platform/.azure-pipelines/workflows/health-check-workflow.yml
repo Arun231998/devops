@@ -1,0 +1,167 @@
+# ============================================================
+# Workflow: Scheduled Infrastructure Health Check
+# Schedule: Every 6 hours across all environments
+# ============================================================
+
+schedules:
+- cron: "0 */6 * * *"
+  displayName: 'Every 6 Hours — Infrastructure Health Check'
+  branches:
+    include:
+      - main
+  always: true   # Run even if no code changes
+
+trigger: none
+pr: none
+
+variables:
+  - group: infra-secrets
+  - name: HEALTH_SCRIPT
+    value: 'azure-devops-linux-platform/scripts/system-health-check.sh'
+  - name: ALERT_EMAIL
+    value: '$(OPS_ALERT_EMAIL)'
+
+stages:
+
+# ──────────────────────────────────────────────
+# DEV Environment Health Check
+# ──────────────────────────────────────────────
+- stage: HealthCheck_Dev
+  displayName: '🟦 Health Check — DEV'
+  jobs:
+  - job: CheckDev
+    displayName: 'Run Health Check on DEV Hosts'
+    pool:
+      name: 'linux-agents-dev'
+    continueOnError: true
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "============================================"
+        echo " Infrastructure Health Check — DEV"
+        echo " Host    : $(hostname -f)"
+        echo " Time    : $(date -u)"
+        echo "============================================"
+        chmod +x $(HEALTH_SCRIPT)
+        $(HEALTH_SCRIPT)
+      displayName: 'Run System Health Check'
+      continueOnError: true
+
+    - script: |
+        RESULT=$?
+        if [ "$RESULT" -ne 0 ]; then
+          echo "##vso[task.logissue type=warning]Health check issues detected on DEV"
+        fi
+      displayName: 'Evaluate Result'
+      condition: always()
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Health Report'
+      inputs:
+        targetPath: '/tmp/health-*.txt'
+        artifact: 'health-report-dev-$(Build.BuildId)'
+      condition: always()
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# STAGING Environment Health Check
+# ──────────────────────────────────────────────
+- stage: HealthCheck_Staging
+  displayName: '🟨 Health Check — STAGING'
+  dependsOn: HealthCheck_Dev
+  condition: always()
+  jobs:
+  - job: CheckStaging
+    displayName: 'Run Health Check on STAGING Hosts'
+    pool:
+      name: 'linux-agents-staging'
+    continueOnError: true
+    steps:
+    - checkout: self
+
+    - script: |
+        chmod +x $(HEALTH_SCRIPT)
+        $(HEALTH_SCRIPT)
+      displayName: 'Run System Health Check'
+      continueOnError: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Health Report'
+      inputs:
+        targetPath: '/tmp/health-*.txt'
+        artifact: 'health-report-staging-$(Build.BuildId)'
+      condition: always()
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# PRODUCTION Environment Health Check
+# ──────────────────────────────────────────────
+- stage: HealthCheck_Prod
+  displayName: '🟥 Health Check — PRODUCTION'
+  dependsOn: HealthCheck_Staging
+  condition: always()
+  jobs:
+  - job: CheckProd
+    displayName: 'Run Health Check on PRODUCTION Hosts'
+    pool:
+      name: 'linux-agents-prod'
+    continueOnError: true
+    steps:
+    - checkout: self
+
+    - script: |
+        chmod +x $(HEALTH_SCRIPT)
+        $(HEALTH_SCRIPT)
+      displayName: 'Run System Health Check'
+      continueOnError: true
+
+    - script: |
+        # Send alert if production health check fails
+        if [ $? -ne 0 ]; then
+          echo "##vso[task.logissue type=error]PRODUCTION health check FAILED"
+          echo "##[error]Critical: Production infrastructure health check failed!"
+          # Trigger PagerDuty / Teams notification
+          curl -s -X POST "$(TEAMS_WEBHOOK_URL)" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"🚨 PRODUCTION Health Check FAILED on $(hostname) at $(date -u). Build: $(Build.BuildId)\"}" \
+            || true
+        fi
+      displayName: 'Alert on Failure'
+      condition: always()
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Health Report'
+      inputs:
+        targetPath: '/tmp/health-*.txt'
+        artifact: 'health-report-prod-$(Build.BuildId)'
+      condition: always()
+      continueOnError: true
+
+# ──────────────────────────────────────────────
+# Consolidated Health Summary
+# ──────────────────────────────────────────────
+- stage: Summary
+  displayName: '📊 Health Summary Report'
+  dependsOn:
+    - HealthCheck_Dev
+    - HealthCheck_Staging
+    - HealthCheck_Prod
+  condition: always()
+  jobs:
+  - job: GenerateSummary
+    displayName: 'Generate Consolidated Report'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "============================================"
+        echo " INFRASTRUCTURE HEALTH SUMMARY"
+        echo " Run: $(Build.BuildId)"
+        echo " Time: $(date -u)"
+        echo "============================================"
+        echo "DEV     : ${{ stageDependencies.HealthCheck_Dev.CheckDev.result }}"
+        echo "STAGING : ${{ stageDependencies.HealthCheck_Staging.CheckStaging.result }}"
+        echo "PROD    : ${{ stageDependencies.HealthCheck_Prod.CheckProd.result }}"
+        echo "============================================"
+      displayName: 'Print Summary'

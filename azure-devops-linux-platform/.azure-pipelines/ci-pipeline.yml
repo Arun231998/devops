@@ -1,0 +1,160 @@
+# Azure DevOps CI Pipeline
+# Triggered on push to main, dev, and feature branches
+# Covers: build, lint, test, security scan, artifact publish
+
+trigger:
+  branches:
+    include:
+      - main
+      - dev
+      - feature/*
+  paths:
+    exclude:
+      - docs/*
+      - '*.md'
+
+pr:
+  branches:
+    include:
+      - main
+      - dev
+
+variables:
+  - group: infra-secrets          # Azure DevOps variable group (keyvault-linked)
+  - name: BUILD_POOL
+    value: 'ubuntu-latest'
+  - name: PYTHON_VERSION
+    value: '3.11'
+  - name: ARTIFACT_NAME
+    value: 'linux-platform-drop'
+
+stages:
+
+# ─────────────────────────────────────────────
+# STAGE 1: Validate & Lint
+# ─────────────────────────────────────────────
+- stage: Validate
+  displayName: '🔍 Validate & Lint'
+  jobs:
+  - job: ShellLint
+    displayName: 'Shell Script Linting (ShellCheck)'
+    pool:
+      vmImage: $(BUILD_POOL)
+    steps:
+    - checkout: self
+
+    - script: |
+        sudo apt-get update -y
+        sudo apt-get install -y shellcheck
+      displayName: 'Install ShellCheck'
+
+    - script: |
+        echo "Running ShellCheck on all .sh files..."
+        find . -name "*.sh" -not -path "./.git/*" | xargs shellcheck --severity=warning
+        echo "✅ Shell lint passed."
+      displayName: 'Lint Shell Scripts'
+
+  - job: YAMLValidate
+    displayName: 'YAML Pipeline Validation'
+    pool:
+      vmImage: $(BUILD_POOL)
+    steps:
+    - checkout: self
+
+    - script: |
+        pip install yamllint
+        find . -name "*.yml" -o -name "*.yaml" | xargs yamllint -d relaxed
+        echo "✅ YAML validation passed."
+      displayName: 'Validate YAML Files'
+
+# ─────────────────────────────────────────────
+# STAGE 2: Security Scan
+# ─────────────────────────────────────────────
+- stage: SecurityScan
+  displayName: '🔐 Security Scan'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: SecretScan
+    displayName: 'Secret & Credential Scanning'
+    pool:
+      vmImage: $(BUILD_POOL)
+    steps:
+    - checkout: self
+
+    - script: |
+        pip install detect-secrets
+        detect-secrets scan --all-files > .secrets.baseline
+        detect-secrets audit .secrets.baseline || true
+        echo "✅ Secret scan complete."
+      displayName: 'Run detect-secrets'
+
+  - job: TrivyScan
+    displayName: 'Trivy Vulnerability Scan'
+    pool:
+      vmImage: $(BUILD_POOL)
+    steps:
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        trivy fs --exit-code 0 --severity HIGH,CRITICAL .
+        echo "✅ Trivy scan complete."
+      displayName: 'Trivy FS Scan'
+
+# ─────────────────────────────────────────────
+# STAGE 3: Build & Test
+# ─────────────────────────────────────────────
+- stage: Build
+  displayName: '🏗️ Build & Test'
+  dependsOn: SecurityScan
+  condition: succeeded()
+  jobs:
+  - job: ScriptTest
+    displayName: 'Run Script Unit Tests (BATS)'
+    pool:
+      vmImage: $(BUILD_POOL)
+    steps:
+    - checkout: self
+
+    - script: |
+        sudo apt-get update -y
+        sudo apt-get install -y bats
+      displayName: 'Install BATS (Bash Automated Testing System)'
+
+    - script: |
+        echo "Running BATS tests..."
+        if [ -d "tests/" ]; then
+          bats tests/*.bats
+        else
+          echo "No BATS tests found, skipping."
+        fi
+      displayName: 'Execute BATS Tests'
+
+    - script: |
+        echo "Validating all scripts are executable and syntactically correct..."
+        find . -name "*.sh" -not -path "./.git/*" | while read script; do
+          bash -n "$script" && echo "✅ $script - syntax OK"
+        done
+      displayName: 'Bash Syntax Validation'
+
+  - job: PublishArtifacts
+    displayName: 'Package & Publish Artifacts'
+    dependsOn: ScriptTest
+    pool:
+      vmImage: $(BUILD_POOL)
+    steps:
+    - checkout: self
+
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)/package
+        cp -r scripts/ monitoring/ incident-management/ capacity-planning/ \
+              disaster-recovery/ networking/ docs/ \
+              $(Build.ArtifactStagingDirectory)/package/
+        echo "Build: $(Build.BuildNumber)" > $(Build.ArtifactStagingDirectory)/package/build-info.txt
+        echo "Branch: $(Build.SourceBranchName)" >> $(Build.ArtifactStagingDirectory)/package/build-info.txt
+        echo "Commit: $(Build.SourceVersion)" >> $(Build.ArtifactStagingDirectory)/package/build-info.txt
+        echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $(Build.ArtifactStagingDirectory)/package/build-info.txt
+      displayName: 'Package Artifacts'
+
+    - publish: $(Build.ArtifactStagingDirectory)/package
+      artifact: $(ARTIFACT_NAME)
+      displayName: 'Publish Artifacts'

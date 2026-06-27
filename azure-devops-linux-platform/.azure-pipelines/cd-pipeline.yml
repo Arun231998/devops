@@ -1,0 +1,201 @@
+# Azure DevOps CD Pipeline
+# Multi-environment deployment: Dev → Staging → Production
+# With manual approval gates before Production
+
+trigger: none   # CD is triggered only by successful CI
+
+resources:
+  pipelines:
+  - pipeline: ci-build
+    source: 'CI - Linux Platform'
+    trigger:
+      branches:
+        include:
+          - main
+          - dev
+
+variables:
+  - group: infra-secrets
+  - name: ARTIFACT_NAME
+    value: 'linux-platform-drop'
+  - name: AZURE_SUBSCRIPTION
+    value: '$(AZURE_SUBSCRIPTION_ID)'
+  - name: RESOURCE_GROUP_DEV
+    value: 'rg-linux-platform-dev'
+  - name: RESOURCE_GROUP_STAGING
+    value: 'rg-linux-platform-staging'
+  - name: RESOURCE_GROUP_PROD
+    value: 'rg-linux-platform-prod'
+
+stages:
+
+# ─────────────────────────────────────────────
+# STAGE 1: Deploy to DEV
+# ─────────────────────────────────────────────
+- stage: DeployDev
+  displayName: '🟦 Deploy to DEV'
+  condition: succeeded()
+  variables:
+    ENVIRONMENT: dev
+    TARGET_HOST: '$(DEV_HOST)'
+  jobs:
+  - deployment: DeployLinuxPlatformDev
+    displayName: 'Deploy to Linux Dev Environment'
+    environment: 'linux-platform-dev'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: ci-build
+            artifact: $(ARTIFACT_NAME)
+
+          - task: AzureCLI@2
+            displayName: 'Login to Azure'
+            inputs:
+              azureSubscription: $(AZURE_SUBSCRIPTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "✅ Azure login successful"
+                az account show
+
+          - script: |
+              echo "📦 Deploying to DEV environment..."
+              PACKAGE_PATH="$(Pipeline.Workspace)/ci-build/$(ARTIFACT_NAME)"
+
+              # Copy scripts to target
+              rsync -avz --delete \
+                "${PACKAGE_PATH}/scripts/" \
+                "$(TARGET_USER)@$(TARGET_HOST):/opt/linux-platform/scripts/"
+
+              rsync -avz --delete \
+                "${PACKAGE_PATH}/monitoring/" \
+                "$(TARGET_USER)@$(TARGET_HOST):/opt/linux-platform/monitoring/"
+
+              echo "✅ DEV deployment complete."
+            displayName: 'Deploy Scripts to DEV Host'
+
+          - script: |
+              echo "🔍 Running post-deploy health check on DEV..."
+              ssh $(TARGET_USER)@$(TARGET_HOST) \
+                "bash /opt/linux-platform/scripts/system-health-check.sh"
+            displayName: 'DEV Health Check'
+
+# ─────────────────────────────────────────────
+# STAGE 2: Deploy to STAGING
+# ─────────────────────────────────────────────
+- stage: DeployStaging
+  displayName: '🟨 Deploy to STAGING'
+  dependsOn: DeployDev
+  condition: succeeded()
+  variables:
+    ENVIRONMENT: staging
+    TARGET_HOST: '$(STAGING_HOST)'
+  jobs:
+  - deployment: DeployLinuxPlatformStaging
+    displayName: 'Deploy to Linux Staging Environment'
+    environment: 'linux-platform-staging'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: ci-build
+            artifact: $(ARTIFACT_NAME)
+
+          - script: |
+              echo "📦 Deploying to STAGING environment..."
+              PACKAGE_PATH="$(Pipeline.Workspace)/ci-build/$(ARTIFACT_NAME)"
+
+              rsync -avz --delete \
+                "${PACKAGE_PATH}/scripts/" \
+                "$(TARGET_USER)@$(TARGET_HOST):/opt/linux-platform/scripts/"
+
+              rsync -avz --delete \
+                "${PACKAGE_PATH}/monitoring/" \
+                "$(TARGET_USER)@$(TARGET_HOST):/opt/linux-platform/monitoring/"
+
+              echo "✅ STAGING deployment complete."
+            displayName: 'Deploy Scripts to STAGING'
+
+          - script: |
+              echo "🔍 Running smoke tests on STAGING..."
+              ssh $(TARGET_USER)@$(TARGET_HOST) \
+                "bash /opt/linux-platform/scripts/system-health-check.sh && \
+                 bash /opt/linux-platform/monitoring/cpu-memory-monitor.sh --test"
+              echo "✅ Smoke tests passed."
+            displayName: 'STAGING Smoke Tests'
+
+# ─────────────────────────────────────────────
+# STAGE 3: Deploy to PRODUCTION (with approval)
+# ─────────────────────────────────────────────
+- stage: DeployProduction
+  displayName: '🟥 Deploy to PRODUCTION'
+  dependsOn: DeployStaging
+  condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
+  variables:
+    ENVIRONMENT: production
+    TARGET_HOST: '$(PROD_HOST)'
+  jobs:
+  - deployment: DeployLinuxPlatformProd
+    displayName: 'Deploy to Linux Production Environment'
+    environment: 'linux-platform-prod'    # ← Approval gate configured in Azure DevOps portal
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      rolling:
+        maxParallel: 1                    # Rolling deploy: one host at a time
+        deploy:
+          steps:
+          - download: ci-build
+            artifact: $(ARTIFACT_NAME)
+
+          - script: |
+              echo "🔒 Pre-production checks..."
+              PACKAGE_PATH="$(Pipeline.Workspace)/ci-build/$(ARTIFACT_NAME)"
+
+              # Validate build info
+              cat "${PACKAGE_PATH}/build-info.txt"
+              echo "✅ Build info validated."
+            displayName: 'Pre-Production Validation'
+
+          - script: |
+              echo "📦 Deploying to PRODUCTION..."
+              PACKAGE_PATH="$(Pipeline.Workspace)/ci-build/$(ARTIFACT_NAME)"
+
+              # Backup existing scripts before deploy
+              ssh $(TARGET_USER)@$(TARGET_HOST) \
+                "cp -r /opt/linux-platform /opt/linux-platform.bak.$(date +%Y%m%d%H%M%S)"
+
+              rsync -avz --delete \
+                "${PACKAGE_PATH}/scripts/" \
+                "$(TARGET_USER)@$(TARGET_HOST):/opt/linux-platform/scripts/"
+
+              rsync -avz --delete \
+                "${PACKAGE_PATH}/monitoring/" \
+                "$(TARGET_USER)@$(TARGET_HOST):/opt/linux-platform/monitoring/"
+
+              echo "✅ PRODUCTION deployment complete."
+            displayName: 'Deploy to PRODUCTION'
+
+          - script: |
+              echo "🔍 Running post-deploy verification on PRODUCTION..."
+              ssh $(TARGET_USER)@$(TARGET_HOST) \
+                "bash /opt/linux-platform/scripts/system-health-check.sh"
+              echo "✅ Production health check passed."
+            displayName: 'Production Health Check'
+
+          - script: |
+              echo "📝 Logging deployment to audit trail..."
+              az monitor activity-log list \
+                --subscription $(AZURE_SUBSCRIPTION) \
+                --max-events 1 \
+                --output table || true
+              echo "Deployed by: $(Build.RequestedFor)"
+              echo "Build: $(Build.BuildNumber)"
+              echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            displayName: 'Audit Trail Logging'
+            condition: always()

@@ -1,0 +1,30 @@
+# Python Environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+*.log
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+*.json
+!plan.json # except mock plans if needed, but actually we can ignore json if we want
+
+# IDE / System
+.DS_Store
+.idea/
+.vscode/
+
+# Local Dev Env / Secrets
+.env
+.env.*
+secrets.yaml
+*.pem
+*.key

@@ -1,0 +1,107 @@
+name: AI Terraform Policy Reviewer CI
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'ai-terraform-reviewer/**'
+      - '.github/workflows/terraform-ci.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ai-terraform-reviewer/**'
+      - '.github/workflows/terraform-ci.yml'
+
+jobs:
+  terraform-validate:
+    name: Terraform Format & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Format check
+      run: terraform -chdir=ai-terraform-reviewer/terraform fmt -check
+
+    - name: Terraform Init
+      run: terraform -chdir=ai-terraform-reviewer/terraform init -backend=false
+
+    - name: Terraform Validate
+      run: terraform -chdir=ai-terraform-reviewer/terraform validate
+
+  ai-plan-review:
+    name: AI Plan Review (Simulated Check)
+    needs: terraform-validate
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f ai-terraform-reviewer/requirements.txt ]; then pip install -r ai-terraform-reviewer/requirements.txt; fi
+
+    - name: Create Simulated Plan JSON
+      run: |
+        # Generate a dummy plan JSON structure since GitHub Actions doesn't have active AWS credentials
+        cat << 'EOF' > plan.json
+        {
+          "format_version": "1.2",
+          "resource_changes": [
+            {
+              "address": "aws_eks_cluster.main",
+              "type": "aws_eks_cluster",
+              "name": "main",
+              "provider_name": "registry.terraform.io/hashicorp/aws",
+              "change": {
+                "actions": ["create"]
+              }
+            },
+            {
+              "address": "aws_vpc.eks_vpc",
+              "type": "aws_vpc",
+              "name": "eks_vpc",
+              "provider_name": "registry.terraform.io/hashicorp/aws",
+              "change": {
+                "actions": ["create"]
+              }
+            },
+            {
+              "address": "aws_nat_gateway.nat",
+              "type": "aws_nat_gateway",
+              "name": "nat",
+              "provider_name": "registry.terraform.io/hashicorp/aws",
+              "change": {
+                "actions": ["create"]
+              }
+            }
+          ]
+        }
+        EOF
+
+    - name: Run AI Reviewer
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        python ai-terraform-reviewer/ai_reviewer.py --plan plan.json --output pr_comment.md
+
+    - name: Upload PR Review Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: tf-ai-pr-review
+        path: pr_comment.md

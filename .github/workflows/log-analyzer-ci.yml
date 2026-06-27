@@ -1,0 +1,71 @@
+name: AI Log Analyzer CI
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'ai-k8s-log-analyzer/**'
+      - '.github/workflows/log-analyzer-ci.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ai-k8s-log-analyzer/**'
+      - '.github/workflows/log-analyzer-ci.yml'
+
+jobs:
+  lint-and-test:
+    name: Lint & Dry-run Validate
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f ai-k8s-log-analyzer/requirements.txt ]; then pip install -r ai-k8s-log-analyzer/requirements.txt; fi
+
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 ai-k8s-log-analyzer/main.py --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings.
+        flake8 ai-k8s-log-analyzer/main.py --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Run Dry-Run Script Validation
+      run: |
+        # Run in dry-run/demo mode to ensure no compilation/runtime startup errors
+        # Set dummy environments so it runs
+        export KUBERNETES_SERVICE_HOST=127.0.0.1
+        export KUBERNETES_SERVICE_PORT=443
+        # Running main.py with --help to confirm arg parsing works
+        python ai-k8s-log-analyzer/main.py --help
+
+  build-image:
+    name: Build Docker Image
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker Image (No-Push)
+      uses: docker/build-push-action@v5
+      with:
+        context: ./ai-k8s-log-analyzer
+        file: ./ai-k8s-log-analyzer/Dockerfile
+        push: false
+        tags: arun231998/ai-k8s-log-analyzer:latest

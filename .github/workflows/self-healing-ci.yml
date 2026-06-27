@@ -1,0 +1,56 @@
+name: AI Self-Healing Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'ai-self-healing-ci/**'
+      - '.github/workflows/self-healing-ci.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ai-self-healing-ci/**'
+      - '.github/workflows/self-healing-ci.yml'
+
+jobs:
+  run-and-heal:
+    name: Run Tests & Apply AI Auto-Fix
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
+        if [ -f ai-self-healing-ci/requirements.txt ]; then pip install -r ai-self-healing-ci/requirements.txt; fi
+
+    - name: Run Tests (Expect Failure)
+      id: test-step
+      run: |
+        # Run pytest and pipe output to a log file, but continue even if it fails
+        pytest ai-self-healing-ci/test_app.py > pytest_run.log 2>&1 || echo "TESTS_FAILED=true" >> $GITHUB_ENV
+        cat pytest_run.log
+
+    - name: Run AI Self-Healer if Tests Failed
+      if: env.TESTS_FAILED == 'true'
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        echo "=== Launching AI Self-Healing agent ==="
+        python ai-self-healing-ci/self_healer.py --logs pytest_run.log --file ai-self-healing-ci/test_app.py
+
+    - name: Verify Fix (Re-run Tests)
+      if: env.TESTS_FAILED == 'true'
+      run: |
+        echo "=== Verifying the code fix ==="
+        pytest ai-self-healing-ci/test_app.py

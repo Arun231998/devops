@@ -95,10 +95,6 @@ chmod +x scripts/*.sh monitoring/*.sh incident-management/*.sh \
 
 ---
 
-## 📞 Support & Escalation
-
-See [incident-management/escalation-matrix.md](incident-management/escalation-matrix.md) for escalation procedures and on-call contacts.
-
 ---
 
 ## 📄 License

@@ -2,6 +2,9 @@
 
 Welcome to the **DevOps & AI Systems Engineering Portfolio**. This repository showcases production-grade integrations of Large Language Models (LLMs) with core DevOps practices, including Infrastructure as Code (IaC), GitOps, self-healing continuous integration (CI) workflows, and cloud monitoring.
 
+> [!TIP]
+> Operational documentation, deployment steps, and deeper architectural designs are detailed in the [Project Wiki](docs/Home.md).
+
 ---
 
 ## 🏗️ Architecture & Workflows
@@ -122,6 +125,11 @@ A serverless observability tool that captures application failures from AWS Clou
   # (Simulated dry-run executes automatically when credentials are not configured)
   python -c "import sys; sys.path.append('ai-bedrock-log-diagnostics/lambda'); import handler; handler.lambda_handler({}, None)"
   ```
+
+---
+
+## 📖 Wiki & Documentation
+Detailed architectural deep-dives, developer operational guidelines, and configuration options for all components are maintained in the repository [Wiki Index](docs/Home.md).
 
 ---
 

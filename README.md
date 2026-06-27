@@ -35,9 +35,18 @@ graph TD
         Healer -->|Apply Auto-Fix| Code
     end
 
+    %% Project 4: AWS Bedrock Diagnostics
+    subgraph Bedrock [AWS Bedrock Log Diagnostics (Project 4)]
+        AppLogs[CloudWatch Logs] -->|Filter Trigger| Lambda[Lambda Diagnostics Agent]
+        Lambda -->|Query Model| BedrockFM[AWS Bedrock Claude 3]
+        BedrockFM -->|Diagnostics Report| Lambda
+        Lambda -->|Publish Alert| SNS[SNS Topic Alerts]
+    end
+
     style K8s fill:#f9f9f9,stroke:#333,stroke-width:1px
     style IaC fill:#f9f9f9,stroke:#333,stroke-width:1px
     style Healing fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style Bedrock fill:#f9f9f9,stroke:#333,stroke-width:1px
 ```
 
 ---
@@ -97,6 +106,21 @@ A failure-recovery system that hooks into pipeline stages. If a test fails, the 
   
   # Verify test_app.py is healed and passes
   pytest test_app.py
+  ```
+
+---
+
+### 4. AWS Bedrock Log Diagnostics Agent (`ai-bedrock-log-diagnostics`)
+A serverless observability tool that captures application failures from AWS CloudWatch Logs, feeds them to Claude 3 on AWS Bedrock for analysis, and alerts the engineering team via SNS notifications.
+
+* **Lambda Function**: [handler.py](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-bedrock-log-diagnostics/lambda/handler.py) — Compresses/decompresses payloads and queries Bedrock via Converse API.
+* **Infrastructure**: [main.tf](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-bedrock-log-diagnostics/terraform/main.tf) — Deploys Lambda, IAM Roles, SNS Topic, CloudWatch Log Group, and Subscription Filter.
+* **CI/CD Pipeline**: [bedrock-ci.yml](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/.github/workflows/bedrock-ci.yml)
+* **Demo Run (No AWS/Bedrock access needed)**:
+  ```bash
+  # You can trigger a local python invocation to run simulated diagnostics
+  # (Simulated dry-run executes automatically when credentials are not configured)
+  python -c "import sys; sys.path.append('ai-bedrock-log-diagnostics/lambda'); import handler; handler.lambda_handler({}, None)"
   ```
 
 ---

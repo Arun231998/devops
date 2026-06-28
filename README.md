@@ -59,9 +59,9 @@ graph TD
 ### 1. AI-Powered Kubernetes Log Analyzer (`ai-k8s-log-analyzer`)
 A Kubernetes native agent that monitors pod lifecycles, detects application crashes, retrieves container logs, and analyzes root causes via LLM integration.
 
-* **Core Code**: [main.py](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-k8s-log-analyzer/main.py)
-* **Configuration**: [k8s-manifests.yaml](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-k8s-log-analyzer/k8s-manifests.yaml) — Sets up the RBAC permissions (`ClusterRole`, `ServiceAccount`) and runs the analyzer as a `CronJob`.
-* **CI/CD Pipeline**: [log-analyzer-ci.yml](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/.github/workflows/log-analyzer-ci.yml)
+* **Core Code**: [main.py](ai-k8s-log-analyzer/main.py)
+* **Configuration**: [k8s-manifests.yaml](ai-k8s-log-analyzer/k8s-manifests.yaml) — Sets up the RBAC permissions (`ClusterRole`, `ServiceAccount`) and runs the analyzer as a `CronJob`.
+* **CI/CD Pipeline**: [log-analyzer-ci.yml](.github/workflows/log-analyzer-ci.yml)
 * **Local Run**:
   ```bash
   cd ai-k8s-log-analyzer
@@ -75,15 +75,15 @@ A Kubernetes native agent that monitors pod lifecycles, detects application cras
 ### 2. AI-Driven Terraform Policy & Cost Reviewer (`ai-terraform-reviewer`)
 An automated Pull Request reviewer for Infrastructure as Code (IaC) that audits EKS clusters, networking setups, and storage resources for security vulnerabilities and cost inefficiencies.
 
-* **Terraform Module**: [main.tf](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-terraform-reviewer/terraform/main.tf) — Provisions AWS VPC, NAT Gateway, subnets, KMS key encryption, and EKS Cluster.
-* **Analyzer Script**: [ai_reviewer.py](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-terraform-reviewer/ai_reviewer.py) — Parses JSON plans and calls AI models to write feedback.
-* **CI/CD Pipeline**: [terraform-ci.yml](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/.github/workflows/terraform-ci.yml)
+* **Terraform Module**: [main.tf](ai-terraform-reviewer/terraform/main.tf) — Provisions AWS VPC, NAT Gateway, subnets, KMS key encryption, and EKS Cluster.
+* **Analyzer Script**: [ai_reviewer.py](ai-terraform-reviewer/ai_reviewer.py) — Parses JSON plans and calls AI models to write feedback.
+* **CI/CD Pipeline**: [terraform-ci.yml](.github/workflows/terraform-ci.yml)
 * **Local Run**:
   ```bash
   cd ai-terraform-reviewer
   # Install dependencies
   pip install -r requirements.txt
-  
+
   # Run the reviewer on a simulated plan
   python ai_reviewer.py --plan ../.github/workflows/terraform-ci.yml --output review_output.md
   ```
@@ -93,20 +93,20 @@ An automated Pull Request reviewer for Infrastructure as Code (IaC) that audits 
 ### 3. Self-Healing CI/CD Pipeline (`ai-self-healing-ci`)
 A failure-recovery system that hooks into pipeline stages. If a test fails, the agent parses the console output/stack traces, locates the buggy file, queries the AI to write a patch, and applies the fix directly to the repository.
 
-* **Fixing Agent**: [self_healer.py](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-self-healing-ci/self_healer.py)
-* **Deliberately Failing Test**: [test_app.py](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-self-healing-ci/test_app.py) — Contains a failing assertion to demonstrate auto-repair.
-* **CI/CD Pipeline**: [self-healing-ci.yml](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/.github/workflows/self-healing-ci.yml)
+* **Fixing Agent**: [self_healer.py](ai-self-healing-ci/self_healer.py)
+* **Deliberately Failing Test**: [test_app.py](ai-self-healing-ci/test_app.py) — Contains a failing assertion to demonstrate auto-repair.
+* **CI/CD Pipeline**: [self-healing-ci.yml](.github/workflows/self-healing-ci.yml)
 * **Demo Run (No Keys Required)**:
   ```bash
   cd ai-self-healing-ci
   pip install -r requirements.txt
-  
+
   # Run tests to generate a failing log
   pytest test_app.py > test.log 2>&1
-  
+
   # Execute Self-Healer (automatically updates test_app.py assert)
   python self_healer.py --logs test.log --file test_app.py
-  
+
   # Verify test_app.py is healed and passes
   pytest test_app.py
   ```
@@ -116,9 +116,9 @@ A failure-recovery system that hooks into pipeline stages. If a test fails, the 
 ### 4. AWS Bedrock Log Diagnostics Agent (`ai-bedrock-log-diagnostics`)
 A serverless observability tool that captures application failures from AWS CloudWatch Logs, feeds them to Claude 3 on AWS Bedrock for analysis, and alerts the engineering team via SNS notifications.
 
-* **Lambda Function**: [handler.py](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-bedrock-log-diagnostics/lambda/handler.py) — Compresses/decompresses payloads and queries Bedrock via Converse API.
-* **Infrastructure**: [main.tf](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/ai-bedrock-log-diagnostics/terraform/main.tf) — Deploys Lambda, IAM Roles, SNS Topic, CloudWatch Log Group, and Subscription Filter.
-* **CI/CD Pipeline**: [bedrock-ci.yml](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/.github/workflows/bedrock-ci.yml)
+* **Lambda Function**: [handler.py](ai-bedrock-log-diagnostics/lambda/handler.py) — Compresses/decompresses payloads and queries Bedrock via Converse API.
+* **Infrastructure**: [main.tf](ai-bedrock-log-diagnostics/terraform/main.tf) — Deploys Lambda, IAM Roles, SNS Topic, CloudWatch Log Group, and Subscription Filter.
+* **CI/CD Pipeline**: [bedrock-ci.yml](.github/workflows/bedrock-ci.yml)
 * **Demo Run (No AWS/Bedrock access needed)**:
   ```bash
   # You can trigger a local python invocation to run simulated diagnostics
@@ -130,8 +130,3 @@ A serverless observability tool that captures application failures from AWS Clou
 
 ## 📖 Wiki & Documentation
 Detailed architectural deep-dives, developer operational guidelines, and configuration options for all components are maintained in the repository [Wiki Index](docs/Home.md).
-
----
-
-## 🗄️ Legacy Experiments
-Existing configurations and trial pipelines have been archived inside [legacy-experiments/](file:///Users/Arunkumar/.gemini/antigravity/scratch/devops/legacy-experiments/) to keep the main development root clean and clean of boilerplate templates.
